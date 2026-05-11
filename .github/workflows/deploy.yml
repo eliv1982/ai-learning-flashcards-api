@@ -59,4 +59,4 @@ jobs:
             docker pull ghcr.io/${{ github.repository }}:latest
             docker stop ai-learning-flashcards-api || true
             docker rm ai-learning-flashcards-api || true
-            docker run -d --name ai-learning-flashcards-api --restart unless-stopped -p 8000:8000 ghcr.io/${{ github.repository }}:latest
+            docker run -d --name ai-learning-flashcards-api --restart unless-stopped -p 8010:8000 ghcr.io/${{ github.repository }}:latest
