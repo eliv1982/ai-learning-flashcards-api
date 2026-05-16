@@ -1,9 +1,14 @@
 import json
 import random
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+from app.observability import send_log_to_loki
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "flashcards.json"
 
@@ -19,6 +24,7 @@ def _load_cards() -> list[dict]:
 async def lifespan(app: FastAPI):
     global _cards
     _cards = _load_cards()
+    send_log_to_loki("Application started", level="INFO")
     yield
 
 
@@ -28,6 +34,31 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+class LokiLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        status_code = response.status_code
+        level = "ERROR" if status_code >= 400 else "INFO"
+        message = (
+            f"{request.method} {request.url.path} "
+            f"{status_code} {duration_ms}ms"
+        )
+        send_log_to_loki(
+            message,
+            level=level,
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+        )
+        return response
+
+
+app.add_middleware(LokiLoggingMiddleware)
 
 
 @app.get("/")
