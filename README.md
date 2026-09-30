@@ -116,20 +116,34 @@ API-контейнер отправляет логи в Loki по адресу `
 docker network create flashcards-observability || true
 ```
 
-Из корня репозитория:
+Пароль администратора Grafana задаётся через переменную окружения `GRAFANA_ADMIN_PASSWORD`. Значения по умолчанию нет: если переменная не задана или пуста, `docker compose` завершается с ошибкой. Реальный пароль не хранится в репозитории — скопируйте шаблон и впишите свой пароль (файл `monitoring/.env` игнорируется git, не используйте `admin`):
 
 ```bash
 cd monitoring
+cp .env.example .env          # Windows: copy .env.example .env
+# откройте .env и задайте GRAFANA_ADMIN_PASSWORD
 docker compose up -d
 ```
 
-- **Grafana:** [http://localhost:3000](http://localhost:3000) (логин/пароль: `admin` / `admin`)
+Docker Compose автоматически читает `monitoring/.env` при любой команде `docker compose` из этого каталога (включая `down` и `ps`).
+
+- **Grafana:** [http://localhost:3000](http://localhost:3000) — логин `admin`, пароль из `GRAFANA_ADMIN_PASSWORD`
 - **Loki** на хосте: `http://localhost:3100`
 - **Loki** внутри Docker-сети `flashcards-observability`: `http://loki:3100`
+
+Порты Grafana (`3000`) и Loki (`3100`) опубликованы **только на `127.0.0.1`** хоста, поэтому с других машин они недоступны. API-контейнер отправляет логи в Loki по Docker-сети (`http://loki:3100`), внешний порт для этого не нужен.
 
 Data Source Loki подключается автоматически через `monitoring/grafana/provisioning/datasources/datasources.yml`.
 
 Оба сервиса (`loki`, `grafana`) и API-контейнер на сервере используют одну сеть **`flashcards-observability`** — см. `monitoring/docker-compose.yml` и job `deploy` в workflow.
+
+#### Хранение данных, перезапуск и retention
+
+- Данные хранятся в именованных Docker-томах: `monitoring_grafana-data` (`/var/lib/grafana`) и `monitoring_loki-data` (`/loki`). Они переживают `docker compose down` и `docker compose up -d`. Команда `docker compose down -v` удаляет тома вместе с данными.
+- Для обоих сервисов задан `restart: unless-stopped`: после перезапуска хоста или Docker они поднимаются сами (если не были остановлены вручную).
+- Loki хранит логи **7 дней** (`limits_config.retention_period: 168h` и `compactor.retention_enabled: true` в `monitoring/loki-config.yml`), более старые данные удаляются компактором.
+- `GRAFANA_ADMIN_PASSWORD` применяется только при первой инициализации тома Grafana. Чтобы сменить пароль позже, выполните `docker compose exec grafana grafana cli admin reset-admin-password '<новый пароль>'`.
+- Если monitoring stack уже запускался по старому `docker-compose.yml` (без томов), логи и настройки Grafana лежали внутри контейнеров и при пересоздании не сохранятся.
 
 ### Server deployment: monitoring stack
 
@@ -140,13 +154,22 @@ git clone <URL-репозитория>   # или обновите уже кло
 cd ai-learning-flashcards-api
 docker network create flashcards-observability || true
 cd monitoring
+cp .env.example .env
+nano .env                     # задайте GRAFANA_ADMIN_PASSWORD (не используйте admin)
 docker compose up -d
 docker compose ps
 ```
 
 Проверка:
 
-- Grafana: `http://<IP-сервера>:3000` (`admin` / `admin`)
+- Grafana и Loki на сервере слушают только `127.0.0.1`, поэтому `http://<IP-сервера>:3000` снаружи недоступен. Порт `3000` в firewall открывать не нужно.
+- Доступ к Grafana со своего компьютера — через SSH-туннель:
+
+  ```bash
+  ssh -L 3000:127.0.0.1:3000 <пользователь>@<IP-сервера>
+  ```
+
+  Пока туннель открыт, Grafana доступна на [http://localhost:3000](http://localhost:3000) (логин `admin`, пароль из `monitoring/.env` на сервере).
 - Loki push из контейнера API: `http://loki:3100/loki/api/v1/push` (сеть `flashcards-observability`)
 
 После `push` в `main` GitHub Actions пересоздаёт API-контейнер уже в этой сети с нужными `-e LOKI_URL=...`. Убедитесь, что monitoring stack запущен **до** генерации трафика к API.
@@ -196,7 +219,7 @@ LOKI_URL=http://loki:3100/loki/api/v1/push
 
 Для pie chart создайте панель типа **Pie chart** и укажите запрос выше (диапазон времени берётся из `$__range` дашборда).
 
-На сервере откройте Grafana (`http://<IP>:3000`) → **Explore** → datasource **Loki** → вставьте запросы из таблицы. Диапазон времени: **Last 15 minutes** (или шире, если логи старые).
+Откройте Grafana (локально — `http://localhost:3000`, на сервере — через SSH-туннель, см. выше) → **Explore** → datasource **Loki** → вставьте запросы из таблицы. Диапазон времени: **Last 15 minutes** (или шире, если логи старые).
 
 ### Screenshots для сдачи ДЗ
 

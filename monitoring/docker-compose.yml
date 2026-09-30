@@ -1,27 +1,35 @@
 services:
   loki:
     image: grafana/loki:2.9.0
+    restart: unless-stopped
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     volumes:
       - ./loki-config.yml:/etc/loki/local-config.yaml
+      - loki-data:/loki
     command: -config.file=/etc/loki/local-config.yaml
     networks:
       - flashcards-observability
 
   grafana:
     image: grafana/grafana:10.1.0
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required - copy monitoring/.env.example to monitoring/.env and set it}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
     depends_on:
       - loki
     networks:
       - flashcards-observability
+
+volumes:
+  loki-data:
+  grafana-data:
 
 networks:
   flashcards-observability:
