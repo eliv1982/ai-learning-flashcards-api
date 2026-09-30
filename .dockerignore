@@ -1,11 +1,27 @@
+# The image needs only requirements.txt, main.py, app/ and data/ (see Dockerfile).
+# Patterns here are anchored at the build-context root, so "**/" is needed to match
+# nested paths such as app/__pycache__.
 .git
 .github
-__pycache__
-*.pyc
-*.pyo
-.pytest_cache
 .venv
 venv
 env
 .idea
 .vscode
+
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+.coverage
+
+# Never send local secrets to the build context.
+**/.env
+**/.env.*
+
+# Not part of the runtime image.
+tests
+monitoring
+requirements-dev.txt
+pytest.ini
+README.md
