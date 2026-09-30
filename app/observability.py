@@ -10,7 +10,7 @@ import requests
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_LOKI_URL = "http://localhost:3100/loki/api/v1/push"
-DEFAULT_APP_NAME = "ai-learning-flashcards-api"
+DEFAULT_APP_NAME = "learning-flashcards-api"
 
 LOKI_TIMEOUT = (1.0, 2.0)  # (connect, read) seconds
 MAX_QUEUE_SIZE = 1000

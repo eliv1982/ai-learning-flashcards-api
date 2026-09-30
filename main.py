@@ -26,7 +26,7 @@ Cards = Annotated[list[Card], Depends(get_cards)]
 @router.get("/")
 def root() -> RootResponse:
     return RootResponse(
-        service="AI Learning Flashcards API",
+        service="Learning Flashcards API",
         description="Мини-API с учебными карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
         docs="/docs",
         endpoints={
@@ -86,7 +86,7 @@ def create_app(
             event_logger.stop()
 
     app = FastAPI(
-        title="AI Learning Flashcards API",
+        title="Learning Flashcards API",
         description="Учебное API с карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
         version="1.0.0",
         lifespan=lifespan,

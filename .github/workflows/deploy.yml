@@ -259,7 +259,7 @@ jobs:
 
             # Production values. The DEPLOY_* overrides exist only so this script can be
             # rehearsed against a disposable local Docker; the workflow never sets them.
-            NAME="${DEPLOY_NAME:-ai-learning-flashcards-api}"
+            NAME="${DEPLOY_NAME:-learning-flashcards-api}"
             NETWORK="${DEPLOY_NETWORK:-flashcards-observability}"
             HOST_PORT="${DEPLOY_HOST_PORT:-8010}"
             HEALTH_TIMEOUT="${DEPLOY_HEALTH_TIMEOUT:-30}"
@@ -432,7 +432,7 @@ jobs:
               --name "$NAME" \
               --restart unless-stopped \
               --network "$NETWORK" \
-              -e APP_NAME=ai-learning-flashcards-api \
+              -e APP_NAME=learning-flashcards-api \
               -e LOKI_URL=http://loki:3100/loki/api/v1/push \
               -p "${HOST_PORT}:8000" \
               "$DEPLOY_IMAGE" >/dev/null
