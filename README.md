@@ -97,7 +97,7 @@ API-контейнер отправляет логи в Loki по адресу `
 
 ## Monitoring with Loki and Grafana
 
-Приложение отправляет логи напрямую в **Loki** через HTTP `POST /loki/api/v1/push` (без Promtail). Каждый HTTP-запрос логируется middleware: method, path, status_code, duration_ms. При старте приложения отправляется отдельная запись `Application started`.
+Приложение отправляет логи напрямую в **Loki** через HTTP `POST /loki/api/v1/push` (без Promtail). Каждый HTTP-запрос логируется middleware; в теле сообщения (JSON) пишутся `method`, `route` (шаблон маршрута, например `/cards/{card_id}`, либо `unmatched`), `status_code`, `duration_ms`. Уровень: `5xx` — `ERROR` (в том числе необработанные исключения), `4xx` — `WARNING`, остальные — `INFO`. Labels в Loki только `app`, `level`, `method`; остальные значения в labels не выносятся, чтобы не раздувать кардинальность (для разбора используйте `| json`). При старте приложения отправляется отдельная запись `{"event": "application_started"}`.
 
 ### Переменные окружения
 
@@ -106,7 +106,7 @@ API-контейнер отправляет логи в Loki по адресу `
 | `LOKI_URL` | `http://localhost:3100/loki/api/v1/push` | URL push API Loki |
 | `APP_NAME` | `ai-learning-flashcards-api` | Label `app` в Loki |
 
-Если Loki недоступен, приложение **не падает** — в stdout выводится предупреждение `WARNING: Failed to send log to Loki: ...`.
+Отправка не блокирует обработку запросов: middleware только кладёт событие в ограниченную очередь (1000 событий), а один фоновый поток отправляет их в Loki с таймаутом `(connect 1 с, read 2 с)`. Если Loki недоступен или не отвечает, приложение **не падает и не замедляется** — при переполнении очереди события отбрасываются, а в stdout не чаще раза в минуту выводится предупреждение `WARNING: Failed to send log to Loki: ...`.
 
 ### Запуск monitoring stack (локально)
 
@@ -182,7 +182,7 @@ curl http://127.0.0.1:8010/cards
 curl http://127.0.0.1:8010/cards/999
 ```
 
-Последний запрос даст **404** и запись с `level="ERROR"` в Loki.
+Последний запрос даст **404** и запись с `level="WARNING"` в Loki (`ERROR` — только для ответов `5xx`).
 
 ### Запуск API с логированием
 
@@ -226,11 +226,11 @@ LOKI_URL=http://loki:3100/loki/api/v1/push
 Сохраните скриншоты (локально или на сервере):
 
 1. **Терминал** — `docker network create flashcards-observability || true` и `docker compose up -d` в `monitoring/`, вывод `docker compose ps` (контейнеры `loki`, `grafana` в статусе running).
-2. **Grafana → Explore → Loki** — таблица логов по запросу `{app="ai-learning-flashcards-api"}` с полями method, endpoint, status_code после нескольких `curl` к API.
-3. **Grafana — Pie chart** — запрос `sum by (level) (count_over_time({app="ai-learning-flashcards-api"}[$__range]))`, видны уровни INFO и ERROR.
+2. **Grafana → Explore → Loki** — таблица логов по запросу `{app="ai-learning-flashcards-api"} | json` с полями method, route, status_code после нескольких `curl` к API.
+3. **Grafana — Pie chart** — запрос `sum by (level) (count_over_time({app="ai-learning-flashcards-api"}[$__range]))`, видны уровни INFO и WARNING (например, после запроса `/cards/999`).
 4. **Grafana → Connections → Data sources** — provisioned datasource **Loki** с URL `http://loki:3100`.
 5. **Терминал** — `pytest -q` с результатом `passed` (локальная проверка перед коммитом).
-6. *(Опционально)* **Терминал API** — при остановленном Loki в stdout видно `WARNING: Failed to send log to Loki: ...` (приложение не падает).
+6. *(Опционально)* **Терминал API** — при остановленном Loki в stdout видно `WARNING: Failed to send log to Loki: ...` (приложение не падает и не замедляется).
 
 ### Тесты
 

@@ -1,115 +1,99 @@
 import json
 import random
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from starlette.requests import Request
 
-from app.observability import send_log_to_loki
+from app.cards import Card, load_cards
+from app.observability import EventLogger, LokiLogger, RequestLoggingMiddleware
+from app.schemas import ErrorResponse, HealthResponse, QuizQuestion, RootResponse
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "flashcards.json"
 
-_cards: list[dict] = []
+router = APIRouter()
 
 
-def _load_cards() -> list[dict]:
-    with open(DATA_PATH, encoding="utf-8") as f:
-        return json.load(f)
+def get_cards(request: Request) -> list[Card]:
+    return request.app.state.cards
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _cards
-    _cards = _load_cards()
-    send_log_to_loki("Application started", level="INFO")
-    yield
+Cards = Annotated[list[Card], Depends(get_cards)]
 
 
-app = FastAPI(
-    title="AI Learning Flashcards API",
-    description="Учебное API с карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-
-class LokiLoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        start = time.perf_counter()
-        response = await call_next(request)
-        duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        status_code = response.status_code
-        level = "ERROR" if status_code >= 400 else "INFO"
-        message = (
-            f"{request.method} {request.url.path} "
-            f"{status_code} {duration_ms}ms"
-        )
-        send_log_to_loki(
-            message,
-            level=level,
-            method=request.method,
-            endpoint=request.url.path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-        )
-        return response
-
-
-app.add_middleware(LokiLoggingMiddleware)
-
-
-@app.get("/")
-def root() -> dict:
-    return {
-        "service": "AI Learning Flashcards API",
-        "description": "Мини-API с учебными карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
-        "docs": "/docs",
-        "endpoints": {
+@router.get("/")
+def root() -> RootResponse:
+    return RootResponse(
+        service="AI Learning Flashcards API",
+        description="Мини-API с учебными карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
+        docs="/docs",
+        endpoints={
             "health": "/health",
             "all_cards": "/cards",
             "random_card": "/cards/random",
             "card_by_id": "/cards/{card_id}",
             "quiz": "/quiz",
         },
-    }
+    )
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+@router.get("/health")
+def health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
-@app.get("/cards")
-def list_cards() -> list[dict]:
-    return _cards
+@router.get("/cards")
+def list_cards(cards: Cards) -> list[Card]:
+    return cards
 
 
-@app.get("/cards/random")
-def random_card() -> dict:
-    if not _cards:
-        raise HTTPException(status_code=404, detail="No cards available")
-    return random.choice(_cards)
+@router.get("/cards/random")
+def random_card(cards: Cards) -> Card:
+    return random.choice(cards)
 
 
-@app.get("/cards/{card_id}")
-def get_card(card_id: int) -> dict:
-    for card in _cards:
-        if card.get("id") == card_id:
+@router.get(
+    "/cards/{card_id}",
+    responses={404: {"model": ErrorResponse, "description": "Card not found"}},
+)
+def get_card(card_id: int, cards: Cards) -> Card:
+    for card in cards:
+        if card.id == card_id:
             return card
     raise HTTPException(status_code=404, detail="Card not found")
 
 
-@app.get("/quiz")
-def quiz() -> dict:
-    if not _cards:
-        raise HTTPException(status_code=404, detail="No cards available")
-    card = random.choice(_cards)
-    return {
-        "id": card["id"],
-        "topic": card["topic"],
-        "question": card["question"],
-        "hint": card["hint"],
-    }
+@router.get("/quiz")
+def quiz(cards: Cards) -> QuizQuestion:
+    return QuizQuestion.model_validate(random.choice(cards), from_attributes=True)
+
+
+def create_app(
+    cards_path: Path = DATA_PATH, logger: EventLogger | None = None
+) -> FastAPI:
+    event_logger = logger if logger is not None else LokiLogger.from_env()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.cards = load_cards(cards_path)
+        event_logger.start()
+        event_logger.log(json.dumps({"event": "application_started"}))
+        try:
+            yield
+        finally:
+            event_logger.stop()
+
+    app = FastAPI(
+        title="AI Learning Flashcards API",
+        description="Учебное API с карточками по AI, LLM, RAG, Git, Docker и CI/CD.",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
+    app.include_router(router)
+    app.add_middleware(RequestLoggingMiddleware, logger=event_logger)
+    return app
+
+
+app = create_app()
