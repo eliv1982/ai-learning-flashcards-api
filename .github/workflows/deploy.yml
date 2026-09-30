@@ -1,70 +1,453 @@
-name: Build and push Docker image
+name: CI and deploy
 
 on:
+  pull_request:
   push:
     branches:
       - main
 
-permissions:
-  contents: read
-  packages: write
+# No token permissions by default; every job asks only for what it needs.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build-and-push:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # Same major.minor as the production image (see Dockerfile).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install development dependencies
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  # Builds the image once, smoke-tests that exact image and, on pushes to main only,
+  # publishes that same image. Pull requests stop after the smoke test.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+    env:
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_NAME=${image_name}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${image_name}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${image_name}:sha-${GITHUB_SHA}" \
+            .
+
+      - name: Smoke-test image
+        run: |
+          set -euo pipefail
+          cid=""
+          cleanup() {
+            local rc=$?
+            set +e
+            if [ -n "$cid" ]; then
+              if [ "$rc" -ne 0 ]; then
+                echo "--- container logs"
+                docker logs --tail 50 "$cid" 2>&1
+              fi
+              docker rm -f "$cid" >/dev/null
+            fi
+            exit "$rc"
+          }
+          trap cleanup EXIT
+
+          echo "Checking that the image has no test dependencies"
+          docker run --rm --entrypoint python "$IMAGE_TAG" -c "import importlib.util as u, sys; found = [m for m in ('pytest', 'httpx') if u.find_spec(m)]; print('test packages in image:', found or 'none'); sys.exit(1 if found else 0)"
+
+          # Loki is deliberately unreachable: the API must not depend on it.
+          cid=$(docker run -d -e LOKI_URL=http://127.0.0.1:9/loki/api/v1/push -p 127.0.0.1::8000 "$IMAGE_TAG")
+          base="http://$(docker port "$cid" 8000/tcp | sed -n '1p')"
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 "$base/health" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error title=Smoke test::container did not become healthy within 30s"
+            exit 1
+          fi
+
+          uid=$(docker exec "$cid" sh -c "grep '^Uid:' /proc/1/status | cut -f2")
+          echo "container process uid: $uid"
+          if [ "$uid" = "0" ] || ! [[ "$uid" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Smoke test::container must not run as root (uid=$uid)"
+            exit 1
+          fi
+
+          health=$(curl -fsS --max-time 5 "$base/health")
+          echo "/health -> $health"
+          if [ "$health" != '{"status":"ok"}' ]; then
+            echo "::error title=Smoke test::unexpected /health response"
+            exit 1
+          fi
+
+          quiz=$(curl -fsS --max-time 5 "$base/quiz")
+          echo "/quiz -> $quiz"
+          if ! grep -q '"question"' <<<"$quiz"; then
+            echo "::error title=Smoke test::unexpected /quiz response"
+            exit 1
+          fi
 
       - name: Log in to GitHub Container Registry
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      # Pushes the image that was just smoke-tested (no second build). Deployment consumes
+      # the immutable sha-<commit> tag pinned to its digest; "latest" is convenience only.
+      - name: Publish image
+        id: publish
+        if: env.PUBLISH == 'true'
+        run: |
+          docker push "$IMAGE_TAG"
+          docker tag "$IMAGE_TAG" "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:latest"
+          repo_digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_TAG")
+          digest="${repo_digest#*@}"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error title=Publish::could not determine the pushed image digest"
+            exit 1
+          fi
+          echo "image=${IMAGE_TAG}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Published \`${IMAGE_TAG}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
+    needs: build
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: build-and-push
+    timeout-minutes: 10
+    permissions:
+      contents: read  # tip-of-main check
+      packages: read
+    # One production deployment at a time. A running deployment is never cancelled;
+    # a newer one waits its turn (GitHub keeps only the newest waiting run).
+    # A job-level group is held before the first step runs, so everything below,
+    # including the tip-of-main check, happens while no other deployment can start.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
     steps:
-      - name: Deploy to server via SSH
-        uses: appleboy/ssh-action@v1.2.0
+      # Concurrency serialises deployments but does not order them: a slow build of an
+      # older commit can reach this job after a newer commit has already been deployed.
+      # Deploy only if this run's commit is still the tip of main. Otherwise skip
+      # cleanly (success, not failure): the server is never contacted and there is
+      # nothing to roll back. If the tip cannot be determined the job fails closed.
+      - name: Check this commit is still the tip of main
+        id: tip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          response=$(curl -fsS --retry 3 --retry-all-errors --max-time 20 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/main")
+          main_sha=$(jq -r '.object.sha // empty' <<<"$response")
+          if ! [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Tip of main::could not determine the current commit of main"
+            exit 1
+          fi
+          if [ "$main_sha" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_SHA is the tip of main; deploying."
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Stale deployment skipped::${GITHUB_SHA} is no longer the tip of main (now ${main_sha}); nothing was deployed and the server was not contacted."
+            echo "Skipped deployment of stale commit \`${GITHUB_SHA}\`: main has moved on to \`${main_sha}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check deployment inputs
+        if: steps.tip.outputs.current == 'true'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_FINGERPRINT: ${{ secrets.SSH_FINGERPRINT }}
+          DEPLOY_IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          errors=0
+          fail() {
+            echo "::error title=Deployment input::$1"
+            errors=1
+          }
+          for name in SSH_HOST SSH_PORT SSH_USERNAME SSH_KEY SSH_FINGERPRINT; do
+            [ -n "${!name}" ] || fail "Repository secret $name is not set"
+          done
+          [[ -z "$SSH_PORT" || "$SSH_PORT" =~ ^[0-9]+$ ]] \
+            || fail "SSH_PORT must be a port number"
+          [[ -z "$SSH_FINGERPRINT" || "$SSH_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] \
+            || fail "SSH_FINGERPRINT must look like SHA256:<43 base64 characters>, as printed by ssh-keygen -l"
+          [[ -z "$SSH_KEY" || "$SSH_KEY" == *"PRIVATE KEY"* ]] \
+            || fail "SSH_KEY does not look like a private key"
+          [[ "$DEPLOY_IMAGE" == *":sha-${GITHUB_SHA}@sha256:"* ]] \
+            || fail "The build job did not produce an immutable sha-<commit> image reference"
+          exit "$errors"
+
+      # The action is pinned to the commit of v1.2.0. `fingerprint` makes it verify the
+      # server's host key; when it is empty the action skips that check, hence the
+      # preflight above. script_stop is intentionally not used: it rewrites the script
+      # line by line, which would break the multi-line Bash below.
+      - name: Deploy over SSH
+        if: steps.tip.outputs.current == 'true'
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          DEPLOY_IMAGE: ${{ needs.build.outputs.image }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          envs: DEPLOY_IMAGE,REGISTRY_USER,REGISTRY_TOKEN
+          # The login shell on the server is unknown, so the script is written to a
+          # file and run explicitly with Bash (set -o pipefail is not portable to sh).
           script: |
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker pull ghcr.io/${{ github.repository }}:latest
-            docker network create flashcards-observability || true
-            docker stop ai-learning-flashcards-api || true
-            docker rm ai-learning-flashcards-api || true
+            script_file=$(mktemp)
+            cat > "$script_file" <<'REMOTE_DEPLOY'
+            set -euo pipefail
+
+            : "${DEPLOY_IMAGE:?DEPLOY_IMAGE is required}"
+            : "${REGISTRY_USER:?REGISTRY_USER is required}"
+            : "${REGISTRY_TOKEN:?REGISTRY_TOKEN is required}"
+
+            # Production values. The DEPLOY_* overrides exist only so this script can be
+            # rehearsed against a disposable local Docker; the workflow never sets them.
+            NAME="${DEPLOY_NAME:-ai-learning-flashcards-api}"
+            NETWORK="${DEPLOY_NETWORK:-flashcards-observability}"
+            HOST_PORT="${DEPLOY_HOST_PORT:-8010}"
+            HEALTH_TIMEOUT="${DEPLOY_HEALTH_TIMEOUT:-30}"
+            PREVIOUS="${NAME}-previous"
+
+            docker_config=""
+            old_stopped=0    # the old release was stopped and still carries $NAME
+            old_parked=0     # the old release was renamed to $PREVIOUS (rollback checks Docker, not this)
+            new_attempted=0  # a container named $NAME was (or may have been) created by this run
+
+            log() { printf '[deploy] %s\n' "$*"; }
+
+            # Container names, refreshed on demand. A docker failure aborts the script
+            # instead of being read as "no such container".
+            NAMES=""
+            refresh_names() { NAMES=$(docker ps -a --format '{{.Names}}'); }
+            has() { grep -Fxq -- "$1" <<<"$NAMES"; }
+
+            # 0 when GET /health on the published port answers 200 {"status":"ok"}.
+            # Pure bash (/dev/tcp), so the server needs no curl, wget or python.
+            healthy() {
+              local response
+              # shellcheck disable=SC2016  # $1 is meant to expand in the inner bash
+              response=$(timeout 3 bash -c '
+                exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+                printf "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
+                cat <&3
+              ' _ "$HOST_PORT" 2>/dev/null) || return 1
+              [[ $response == "HTTP/1."*" 200 "* && $response == *'"status":"ok"'* ]]
+            }
+
+            # Waits up to HEALTH_TIMEOUT seconds for $NAME to answer. Gives up early when the
+            # container stops or is restarted by its restart policy (a crash loop).
+            wait_healthy() {
+              local deadline=$((SECONDS + HEALTH_TIMEOUT)) state restarts_at_start
+              restarts_at_start=$(docker inspect --format '{{.RestartCount}}' "$NAME" 2>/dev/null) || return 1
+              while (( SECONDS < deadline )); do
+                state=$(docker inspect --format '{{.State.Running}} {{.RestartCount}}' "$NAME" 2>/dev/null) || return 1
+                if [ "${state% *}" != "true" ] || [ "${state#* }" -gt "$restarts_at_start" ]; then
+                  return 1
+                fi
+                if healthy; then
+                  return 0
+                fi
+                sleep 1
+              done
+              return 1
+            }
+
+            # Failure path: drop the new container and bring the previous release back.
+            # What to restore is decided by the containers that actually exist, not by the
+            # flags above: a TERM/HUP can land right after "docker rename" has succeeded
+            # but before old_parked=1 is assigned, and the flag would then be wrong. The
+            # flags only stand in when Docker cannot be read. Restoring is idempotent
+            # (rename only when $NAME is free; update and start are safe to repeat).
+            # Every step reports its own failure; the deploy still exits non-zero.
+            rollback() {
+              local name_present=0 previous_present=0
+              if refresh_names; then
+                has "$NAME" && name_present=1
+                has "$PREVIOUS" && previous_present=1
+              else
+                log "WARNING: cannot list containers, relying on what this run recorded"
+                name_present=$new_attempted
+                previous_present=$old_parked
+              fi
+              if [ "$new_attempted" = 1 ] && [ "$name_present" = 1 ]; then
+                log "logs of the failed container (last 50 lines):"
+                docker logs --tail 50 "$NAME" 2>&1
+                if docker rm -f "$NAME" >/dev/null; then
+                  name_present=0
+                else
+                  log "WARNING: could not remove the failed container $NAME"
+                fi
+              fi
+              if [ "$name_present" = 1 ] && [ "$new_attempted" = 1 ]; then
+                log "ROLLBACK FAILED: the failed release still occupies $NAME - manual recovery needed"
+                return
+              elif [ "$name_present" = 0 ] && [ "$previous_present" = 1 ]; then
+                log "restoring the previous release from $PREVIOUS"
+                if ! { docker rename "$PREVIOUS" "$NAME" \
+                  && docker update --restart unless-stopped "$NAME" >/dev/null \
+                  && docker start "$NAME" >/dev/null; }; then
+                  log "ROLLBACK FAILED: could not restore $PREVIOUS - manual recovery needed"
+                  return
+                fi
+              elif [ "$name_present" = 1 ] && [ "$old_stopped" = 1 ]; then
+                log "restoring the previous release (restarting it)"
+                if ! docker start "$NAME" >/dev/null; then
+                  log "ROLLBACK FAILED: could not restart $NAME - manual recovery needed"
+                  return
+                fi
+              elif [ "$name_present" = 1 ]; then
+                log "failed before the current release was touched; it keeps running"
+                return
+              elif [ "$new_attempted" = 1 ]; then
+                log "no previous release existed, nothing to restore"
+                return
+              else
+                log "failed before the current release was touched; there was no release to restore"
+                return
+              fi
+              if wait_healthy; then
+                log "previous release restored and healthy"
+              else
+                log "ROLLBACK INCOMPLETE: previous release restarted but /health is not answering"
+              fi
+            }
+
+            on_exit() {
+              local rc=$?
+              trap - EXIT
+              set +e
+              if [ -n "$docker_config" ]; then
+                rm -rf "$docker_config"
+              fi
+              if [ "$rc" -ne 0 ]; then
+                log "DEPLOY FAILED (exit $rc)"
+                rollback
+              fi
+              exit "$rc"
+            }
+            trap on_exit EXIT
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+
+            log "deploying $DEPLOY_IMAGE as $NAME on host port $HOST_PORT"
+
+            # 1. Pull first, with a temporary Docker config so the short-lived registry
+            #    token never lands in the deploy user's own ~/.docker. A missing or
+            #    unauthorised image fails here, before the running service is touched.
+            docker_config=$(mktemp -d)
+            registry="${DEPLOY_IMAGE%%/*}"
+            printf '%s' "$REGISTRY_TOKEN" \
+              | DOCKER_CONFIG="$docker_config" docker login "$registry" --username "$REGISTRY_USER" --password-stdin
+            unset REGISTRY_TOKEN
+            DOCKER_CONFIG="$docker_config" docker pull "$DEPLOY_IMAGE"
+            rm -rf "$docker_config"
+            docker_config=""
+
+            # 2. Shared network with the monitoring stack: create it only when absent.
+            networks=$(docker network ls --format '{{.Name}}')
+            if ! grep -Fxq -- "$NETWORK" <<<"$networks"; then
+              log "creating network $NETWORK"
+              docker network create "$NETWORK" >/dev/null
+            fi
+
+            # 3. Park the running release (stopped, not deleted) so it can be restored.
+            refresh_names
+            if has "$NAME"; then
+              log "stopping the current release"
+              old_stopped=1  # set first: restarting a container that is still running is harmless
+              docker stop "$NAME" >/dev/null
+              if has "$PREVIOUS"; then
+                log "removing the older rollback container $PREVIOUS"
+                docker rm "$PREVIOUS" >/dev/null
+              fi
+              docker rename "$NAME" "$PREVIOUS"
+              old_parked=1
+              docker update --restart no "$PREVIOUS" >/dev/null
+            else
+              log "no current release (first deployment)"
+            fi
+
+            # 4. Start the new release from the immutable image.
+            log "starting the new release"
+            new_attempted=1
             docker run -d \
-              --name ai-learning-flashcards-api \
+              --name "$NAME" \
               --restart unless-stopped \
-              --network flashcards-observability \
+              --network "$NETWORK" \
               -e APP_NAME=ai-learning-flashcards-api \
               -e LOKI_URL=http://loki:3100/loki/api/v1/push \
-              -p 8010:8000 \
-              ghcr.io/${{ github.repository }}:latest
+              -p "${HOST_PORT}:8000" \
+              "$DEPLOY_IMAGE" >/dev/null
+
+            # 5. Success only once /health answers; otherwise the EXIT trap rolls back.
+            if ! wait_healthy; then
+              log "the new release did not become healthy within ${HEALTH_TIMEOUT}s"
+              exit 1
+            fi
+            log "deployment succeeded: $DEPLOY_IMAGE is healthy on port $HOST_PORT"
+            if [ "$old_parked" = 1 ]; then
+              log "previous release kept (stopped) as $PREVIOUS for rollback"
+            fi
+            REMOTE_DEPLOY
+            bash "$script_file"
+            rc=$?
+            rm -f "$script_file"
+            exit "$rc"

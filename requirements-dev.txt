@@ -1,0 +1,12 @@
+# Development and CI test dependencies: the pinned runtime set plus the test tooling.
+# Resolved against requirements.txt on Linux with CPython 3.12. Packages already pinned there are not repeated.
+-r requirements.txt
+
+colorama==0.4.6; sys_platform == "win32"  # via pytest (Windows only)
+httpcore==1.0.9  # via httpx
+httpx==0.28.1  # direct (fastapi.testclient)
+iniconfig==2.3.0  # via pytest
+packaging==26.3  # via pytest
+pluggy==1.6.0  # via pytest
+pygments==2.21.0  # via pytest
+pytest==9.1.1  # direct
